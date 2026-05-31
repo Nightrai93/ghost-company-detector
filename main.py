@@ -4,6 +4,7 @@ import ipaddress
 import asyncio
 import socket
 import httpx
+from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
 from bs4 import BeautifulSoup
@@ -11,14 +12,12 @@ from supabase import create_client, Client
 
 app = FastAPI(title="Anti-Synthetic Corporate KYC API")
 
-# Caricamento credenziali dalle variabili d'ambiente
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 RAPIDAPI_SECRET = os.getenv("RAPIDAPI_PROXY_SECRET")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Impronte linguistiche tipiche dei testi aziendali generati da LLM
 AI_MARKETING_CLICHES = [
     r"in today's fast-paced", r"digital landscape", r"cutting-edge solutions",
     r"revolutionize the way", r"delivering unparalleled", r"at our core",
@@ -29,38 +28,57 @@ AI_MARKETING_CLICHES = [
 class KYCRequest(BaseModel):
     url: str
 
-# Protezione di rete avanzata contro SSRF e DNS Rebinding
 class PinnedIPTransport(httpx.AsyncHTTPTransport):
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        url = request.url
-        hostname = url.host
-        
+        hostname = request.url.host
+        port = request.url.port or (443 if request.url.scheme == "https" else 80)
+
         loop = asyncio.get_running_loop()
         try:
             addr_info = await loop.getaddrinfo(
-                hostname, 
-                url.port or (443 if url.scheme == "https" else 80), 
-                proto=socket.IPPROTO_TCP
+                hostname, port, proto=socket.IPPROTO_TCP
             )
             target_ip = addr_info[0][4][0]
-        except Exception:
-            raise httpx.ConnectError("Impossibile risolvere il DNS dell'URL.")
-        
+        except Exception as e:
+            raise httpx.ConnectError(f"DNS resolution failed for the given URL: {e}")
+
+        # Claude's SSRF FIX
         ip_obj = ipaddress.ip_address(target_ip)
-        if ip_obj.is_private or ip_obj.is_loopback:
-            raise httpx.ConnectError("Accesso negato: Vulnerabilità SSRF bloccata.")
-        
-        request.extensions["sni_hostname"] = hostname
-        request.url = request.url.copy_with(host=target_ip)
-        request.headers["Host"] = hostname
-        
-        return await super().handle_async_request(request)
+        if (ip_obj.is_private or ip_obj.is_loopback or
+                ip_obj.is_link_local or ip_obj.is_reserved or ip_obj.is_multicast):
+            raise httpx.ConnectError("Access denied: SSRF vulnerability blocked.")
+
+        # Claude's Request Immutability FIX
+        new_url = request.url.copy_with(host=target_ip)
+        headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
+        headers["host"] = hostname
+        extensions = {**request.extensions, "sni_hostname": hostname.encode("ascii")}
+
+        new_request = httpx.Request(
+            method=request.method,
+            url=new_url,
+            headers=headers,
+            extensions=extensions,
+        )
+
+        return await super().handle_async_request(new_request)
 
 async def verify_rapidapi_gate(x_rapidapi_proxy_secret: str = Header(None)):
     if not RAPIDAPI_SECRET:
         return
     if x_rapidapi_proxy_secret != RAPIDAPI_SECRET:
-        raise HTTPException(status_code=401, detail="Richiesta non autorizzata. Passa dal gateway di RapidAPI.")
+        raise HTTPException(status_code=401, detail="Unauthorized request. Please go through the RapidAPI gateway.")
+
+# Claude's Async DB Wrappers
+async def _db_get_cached(url: str):
+    return await asyncio.to_thread(
+        lambda: supabase.table("kyc_verifications").select("*").eq("url", url).execute()
+    )
+
+async def _db_upsert(data: dict):
+    return await asyncio.to_thread(
+        lambda: supabase.table("kyc_verifications").upsert(data, on_conflict="url").execute()
+    )
 
 @app.get("/")
 def health():
@@ -69,10 +87,17 @@ def health():
 @app.post("/verify")
 async def verify_company(payload: KYCRequest, _ = Depends(verify_rapidapi_gate)):
     target_url = str(payload.url).strip()
-    
-    # 1. Controllo Cache atomica
+
+    # Claude's URL Validation
+    parsed_url = urlparse(target_url)
+    if parsed_url.scheme not in ("http", "https"):
+        raise HTTPException(status_code=400, detail="Only HTTP and HTTPS URLs are supported.")
+    if not parsed_url.netloc:
+        raise HTTPException(status_code=400, detail="Invalid URL: no host found.")
+
+    # 1. Atomic cache check
     try:
-        cached = supabase.table("kyc_verifications").select("*").eq("url", target_url).execute()
+        cached = await _db_get_cached(target_url)
         if cached.data:
             rec = cached.data[0]
             return {
@@ -89,14 +114,14 @@ async def verify_company(payload: KYCRequest, _ = Depends(verify_rapidapi_gate))
     except Exception:
         pass
 
-    # 2. Scraping Sicuro in Streaming con gestione degli errori esterni
+    # 2. Secure streaming scrape (RESTORED OUR BUSINESS LOGIC)
     html = None
     http_status = 200
     error_mode = None
 
     try:
         transport = PinnedIPTransport(verify=True)
-        # Abilitiamo follow_redirects=True per gestire i cambi dominio automatici
+        # Maintained follow_redirects=True for business logic resilience
         async with httpx.AsyncClient(transport=transport, timeout=8.0, follow_redirects=True) as client:
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -122,19 +147,19 @@ async def verify_company(payload: KYCRequest, _ = Depends(verify_rapidapi_gate))
         http_status = 0
         error_mode = f"CONNECTION_FAILED_{type(e).__name__}"
 
-    # 3. Gestione intelligente dei fallimenti esterni (Niente più errori 400 su RapidAPI!)
+    # 3. Graceful Failure Handling for RapidAPI Success Rate
     if error_mode or http_status != 200:
-        trust_score = 15  # Rischio altissimo se il sito si nasconde o è rotto
+        trust_score = 15
         risk_level = "CRITICAL"
         
         try:
-            supabase.table("kyc_verifications").upsert({
+            await _db_upsert({
                 "url": target_url,
                 "trust_score": trust_score,
                 "risk_level": risk_level,
                 "ai_text_probability": 0,
                 "broken_links_count": 0
-            }, on_conflict="url").execute()
+            })
         except:
             pass
 
@@ -150,36 +175,35 @@ async def verify_company(payload: KYCRequest, _ = Depends(verify_rapidapi_gate))
             }
         }
 
-    # 4. Se il sito è accessibile (Status 200), esegui l'algoritmo euristico
+    # 4. Heuristics Engine
     soup = BeautifulSoup(html, "html.parser")
-    
+
     all_links = soup.find_all("a", href=True)
     dead_links = 0
     social_domains = [r"twitter\.com$", r"linkedin\.com$", r"facebook\.com$", r"instagram\.com$"]
-    
+
     for link in all_links:
         href = link["href"].strip().lower()
         if href in ["#", "", "javascript:void(0)", "javascript:void(0);"]:
             dead_links += 1
         else:
+            # Claude's elegant social link fix
             for pattern in social_domains:
                 if re.search(pattern, href):
-                    dead_links += 1
+                    parsed = urlparse(href)
+                    if not parsed.path.strip("/"):
+                        dead_links += 1
 
     for tag in soup(["script", "style", "nav", "footer"]):
         tag.decompose()
     clean_text = soup.get_text().lower()
 
-    ai_cliche_count = 0
-    for cliche in AI_MARKETING_CLICHES:
-        if re.search(cliche, clean_text):
-            ai_cliche_count += 1
+    ai_cliche_count = sum(
+        1 for cliche in AI_MARKETING_CLICHES if re.search(cliche, clean_text)
+    )
 
-    ai_probability = min(ai_cliche_count * 20, 95)
-    if ai_probability == 0: 
-        ai_probability = 5
-
-    deductions = (min(dead_links * 8, 45) + min(ai_cliche_count * 15, 45))
+    ai_probability = min(ai_cliche_count * 20, 95) or 5
+    deductions = min(dead_links * 8, 45) + min(ai_cliche_count * 15, 45)
     trust_score = max(100 - deductions, 1)
 
     if trust_score > 75:
@@ -190,14 +214,14 @@ async def verify_company(payload: KYCRequest, _ = Depends(verify_rapidapi_gate))
         risk_level = "CRITICAL"
 
     try:
-        supabase.table("kyc_verifications").upsert({
+        await _db_upsert({
             "url": target_url,
             "trust_score": trust_score,
             "risk_level": risk_level,
             "ai_text_probability": ai_probability,
             "broken_links_count": dead_links
-        }, on_conflict="url").execute()
-    except:
+        })
+    except Exception:
         pass
 
     return {
