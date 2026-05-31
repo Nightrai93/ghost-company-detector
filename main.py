@@ -18,7 +18,7 @@ RAPIDAPI_SECRET = os.getenv("RAPIDAPI_PROXY_SECRET")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Impronte linguistiche tipiche dei testi aziendali generati da LLM (ChatGPT/Claude)
+# Impronte linguistiche tipiche dei testi aziendali generati da LLM
 AI_MARKETING_CLICHES = [
     r"in today's fast-paced", r"digital landscape", r"cutting-edge solutions",
     r"revolutionize the way", r"delivering unparalleled", r"at our core",
@@ -29,7 +29,7 @@ AI_MARKETING_CLICHES = [
 class KYCRequest(BaseModel):
     url: str
 
-# Protezione di rete avanzata contro SSRF e DNS Rebinding (Corretta con moduli nativi)
+# Protezione di rete avanzata contro SSRF e DNS Rebinding
 class PinnedIPTransport(httpx.AsyncHTTPTransport):
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         url = request.url
@@ -37,7 +37,6 @@ class PinnedIPTransport(httpx.AsyncHTTPTransport):
         
         loop = asyncio.get_running_loop()
         try:
-            # Risoluzione DNS nativa e asincrona
             addr_info = await loop.getaddrinfo(
                 hostname, 
                 url.port or (443 if url.scheme == "https" else 80), 
@@ -47,12 +46,10 @@ class PinnedIPTransport(httpx.AsyncHTTPTransport):
         except Exception:
             raise httpx.ConnectError("Impossibile risolvere il DNS dell'URL.")
         
-        # Controllo IP Privati/Locali (Blocco SSRF)
         ip_obj = ipaddress.ip_address(target_ip)
         if ip_obj.is_private or ip_obj.is_loopback:
             raise httpx.ConnectError("Accesso negato: Vulnerabilità SSRF bloccata.")
         
-        # Pinning dell'IP contro DNS Rebinding
         request.extensions["sni_hostname"] = hostname
         request.url = request.url.copy_with(host=target_ip)
         request.headers["Host"] = hostname
@@ -92,31 +89,70 @@ async def verify_company(payload: KYCRequest, _ = Depends(verify_rapidapi_gate))
     except Exception:
         pass
 
-    # 2. Scraping Sicuro in Streaming
+    # 2. Scraping Sicuro in Streaming con gestione degli errori esterni
+    html = None
+    http_status = 200
+    error_mode = None
+
     try:
         transport = PinnedIPTransport(verify=True)
-        async with httpx.AsyncClient(transport=transport, timeout=12.0, follow_redirects=False) as client:
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        # Abilitiamo follow_redirects=True per gestire i cambi dominio automatici
+        async with httpx.AsyncClient(transport=transport, timeout=8.0, follow_redirects=True) as client:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5"
+            }
             async with client.stream("GET", target_url, headers=headers) as response:
+                http_status = response.status_code
                 if response.status_code != 200:
-                    raise HTTPException(status_code=400, detail=f"Sito non verificabile. Status code: {response.status_code}")
-                
-                chunks = []
-                size = 0
-                async for chunk in response.aiter_bytes(chunk_size=8192):
-                    chunks.append(chunk)
-                    size += len(chunk)
-                    if size > 3 * 1024 * 1024: # Taglio di sicurezza a 3MB
-                        raise HTTPException(status_code=413, detail="Pagina troppo pesante per gli standard KYC aziendali.")
-                
-                html = b"".join(chunks).decode("utf-8", errors="ignore")
+                    error_mode = f"HTTP_UNAVAILABLE_{response.status_code}"
+                else:
+                    chunks = []
+                    size = 0
+                    async for chunk in response.aiter_bytes(chunk_size=8192):
+                        chunks.append(chunk)
+                        size += len(chunk)
+                        if size > 3 * 1024 * 1024:
+                            error_mode = "PAGE_TOO_LARGE"
+                            break
+                    if not error_mode:
+                        html = b"".join(chunks).decode("utf-8", errors="ignore")
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Errore durante l'analisi di rete: {str(e)}")
+        http_status = 0
+        error_mode = f"CONNECTION_FAILED_{type(e).__name__}"
 
-    # 3. Motore di Analisi (Heuristics Engine)
+    # 3. Gestione intelligente dei fallimenti esterni (Niente più errori 400 su RapidAPI!)
+    if error_mode or http_status != 200:
+        trust_score = 15  # Rischio altissimo se il sito si nasconde o è rotto
+        risk_level = "CRITICAL"
+        
+        try:
+            supabase.table("kyc_verifications").upsert({
+                "url": target_url,
+                "trust_score": trust_score,
+                "risk_level": risk_level,
+                "ai_text_probability": 0,
+                "broken_links_count": 0
+            }, on_conflict="url").execute()
+        except:
+            pass
+
+        return {
+            "status": "success",
+            "source": "live_audit_anomaly",
+            "target_url": target_url,
+            "corporate_trust_score": trust_score,
+            "risk_level": risk_level,
+            "analysis": {
+                "verification_failed": True,
+                "failure_reason": f"Target corporate site is unreachable or blocking connection. Status: {http_status} ({error_mode})."
+            }
+        }
+
+    # 4. Se il sito è accessibile (Status 200), esegui l'algoritmo euristico
     soup = BeautifulSoup(html, "html.parser")
     
-    # Estraiamo i link social per trovare "link morti"
     all_links = soup.find_all("a", href=True)
     dead_links = 0
     social_domains = [r"twitter\.com$", r"linkedin\.com$", r"facebook\.com$", r"instagram\.com$"]
@@ -130,7 +166,6 @@ async def verify_company(payload: KYCRequest, _ = Depends(verify_rapidapi_gate))
                 if re.search(pattern, href):
                     dead_links += 1
 
-    # Pulizia del testo per trovare i cliché degli LLM
     for tag in soup(["script", "style", "nav", "footer"]):
         tag.decompose()
     clean_text = soup.get_text().lower()
@@ -140,12 +175,10 @@ async def verify_company(payload: KYCRequest, _ = Depends(verify_rapidapi_gate))
         if re.search(cliche, clean_text):
             ai_cliche_count += 1
 
-    # Calcolo dei punteggi di rischio
     ai_probability = min(ai_cliche_count * 20, 95)
     if ai_probability == 0: 
         ai_probability = 5
 
-    # Calcolo del Trust Score complessivo (da 1 a 100)
     deductions = (min(dead_links * 8, 45) + min(ai_cliche_count * 15, 45))
     trust_score = max(100 - deductions, 1)
 
@@ -156,7 +189,6 @@ async def verify_company(payload: KYCRequest, _ = Depends(verify_rapidapi_gate))
     else:
         risk_level = "CRITICAL"
 
-    # 4. Salvataggio su DB per la cache futura
     try:
         supabase.table("kyc_verifications").upsert({
             "url": target_url,
@@ -165,7 +197,7 @@ async def verify_company(payload: KYCRequest, _ = Depends(verify_rapidapi_gate))
             "ai_text_probability": ai_probability,
             "broken_links_count": dead_links
         }, on_conflict="url").execute()
-    except Exception:
+    except:
         pass
 
     return {
