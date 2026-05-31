@@ -107,7 +107,7 @@ async def verify_company(payload: KYCRequest, _ = Depends(verify_rapidapi_gate))
     # 3. Motore di Analisi (Heuristics Engine)
     soup = BeautifulSoup(html, "html.parser")
     
-    # Estraiamo i link social per trovare "link morti" (tipici dei template AI pronti in 5 secondi)
+    # Estraiamo i link social per trovare "link morti"
     all_links = soup.find_all("a", href=True)
     dead_links = 0
     social_domains = [r"twitter\.com$", r"linkedin\.com$", r"facebook\.com$", r"instagram\.com$"]
@@ -118,7 +118,7 @@ async def verify_company(payload: KYCRequest, _ = Depends(verify_rapidapi_gate))
             dead_links += 1
         else:
             for pattern in social_domains:
-                if re.search(pattern, href): # Se punta alla home del social e non a una pagina aziendale reale
+                if re.search(pattern, href):
                     dead_links += 1
 
     # Pulizia del testo per trovare i cliché degli LLM
@@ -133,10 +133,10 @@ async def verify_company(payload: KYCRequest, _ = Depends(verify_rapidapi_gate))
 
     # Calcolo dei punteggi di rischio
     ai_probability = min(ai_cliche_count * 20, 95)
-    if ai_probability == 0: ai_probability = 5
+    if ai_probability == 0: 
+        ai_probability = 5
 
     # Calcolo del Trust Score complessivo (da 1 a 100)
-    # Penalizziamo molto i link social non configurati e i testi palesemente scritti da ChatGPT
     deductions = (min(dead_links * 8, 45) + min(ai_cliche_count * 15, 45))
     trust_score = max(100 - deductions, 1)
 
@@ -165,4 +165,8 @@ async def verify_company(payload: KYCRequest, _ = Depends(verify_rapidapi_gate))
         "target_url": target_url,
         "corporate_trust_score": trust_score,
         "risk_level": risk_level,
-        "analysis
+        "analysis": {
+            "ai_text_probability": f"{ai_probability}%",
+            "dead_or_placeholder_links": dead_links
+        }
+    }
