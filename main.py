@@ -5,7 +5,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
 from bs4 import BeautifulSoup
-from supabase import create_instance, Client
+from supabase import create_client, Client
 
 app = FastAPI(title="Anti-Synthetic Corporate KYC API")
 
@@ -14,7 +14,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 RAPIDAPI_SECRET = os.getenv("RAPIDAPI_PROXY_SECRET")
 
-supabase: Client = create_instance(SUPABASE_URL, SUPABASE_KEY)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Impronte linguistiche tipiche dei testi aziendali generati da LLM (ChatGPT/Claude)
 AI_MARKETING_CLICHES = [
@@ -165,8 +165,4 @@ async def verify_company(payload: KYCRequest, _ = Depends(verify_rapidapi_gate))
         "target_url": target_url,
         "corporate_trust_score": trust_score,
         "risk_level": risk_level,
-        "analysis": {
-            "ai_text_probability": f"{ai_probability}%",
-            "dead_or_placeholder_links": dead_links
-        }
-    }
+        "analysis
