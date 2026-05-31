@@ -1,6 +1,8 @@
 import os
 import re
 import ipaddress
+import asyncio
+import socket
 import httpx
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
@@ -27,23 +29,30 @@ AI_MARKETING_CLICHES = [
 class KYCRequest(BaseModel):
     url: str
 
-# Protezione di rete avanzata contro SSRF e DNS Rebinding
+# Protezione di rete avanzata contro SSRF e DNS Rebinding (Corretta con moduli nativi)
 class PinnedIPTransport(httpx.AsyncHTTPTransport):
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         url = request.url
         hostname = url.host
         
-        loop = httpx.get_async_client()._transport._pool._loop
+        loop = asyncio.get_running_loop()
         try:
-            addr_info = await loop.getaddrinfo(hostname, url.port or (443 if url.scheme == "https" else 80))
+            # Risoluzione DNS nativa e asincrona
+            addr_info = await loop.getaddrinfo(
+                hostname, 
+                url.port or (443 if url.scheme == "https" else 80), 
+                proto=socket.IPPROTO_TCP
+            )
             target_ip = addr_info[0][4][0]
         except Exception:
             raise httpx.ConnectError("Impossibile risolvere il DNS dell'URL.")
         
+        # Controllo IP Privati/Locali (Blocco SSRF)
         ip_obj = ipaddress.ip_address(target_ip)
         if ip_obj.is_private or ip_obj.is_loopback:
             raise httpx.ConnectError("Accesso negato: Vulnerabilità SSRF bloccata.")
         
+        # Pinning dell'IP contro DNS Rebinding
         request.extensions["sni_hostname"] = hostname
         request.url = request.url.copy_with(host=target_ip)
         request.headers["Host"] = hostname
