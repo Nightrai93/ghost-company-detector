@@ -4,6 +4,7 @@ import ipaddress
 import asyncio
 import socket
 import httpx
+from datetime import datetime, timedelta
 from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
@@ -15,6 +16,8 @@ app = FastAPI(title="Anti-Synthetic Corporate KYC API")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 RAPIDAPI_SECRET = os.getenv("RAPIDAPI_PROXY_SECRET")
+
+CACHE_TTL_HOURS = 24
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -42,13 +45,11 @@ class PinnedIPTransport(httpx.AsyncHTTPTransport):
         except Exception as e:
             raise httpx.ConnectError(f"DNS resolution failed for the given URL: {e}")
 
-        # Claude's SSRF FIX
         ip_obj = ipaddress.ip_address(target_ip)
         if (ip_obj.is_private or ip_obj.is_loopback or
                 ip_obj.is_link_local or ip_obj.is_reserved or ip_obj.is_multicast):
             raise httpx.ConnectError("Access denied: SSRF vulnerability blocked.")
 
-        # Claude's Request Immutability FIX
         new_url = request.url.copy_with(host=target_ip)
         headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
         headers["host"] = hostname
@@ -69,10 +70,14 @@ async def verify_rapidapi_gate(x_rapidapi_proxy_secret: str = Header(None)):
     if x_rapidapi_proxy_secret != RAPIDAPI_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized request. Please go through the RapidAPI gateway.")
 
-# Claude's Async DB Wrappers
 async def _db_get_cached(url: str):
+    cutoff = (datetime.utcnow() - timedelta(hours=CACHE_TTL_HOURS)).isoformat()
     return await asyncio.to_thread(
-        lambda: supabase.table("kyc_verifications").select("*").eq("url", url).execute()
+        lambda: supabase.table("kyc_verifications")
+            .select("*")
+            .eq("url", url)
+            .gte("checked_at", cutoff)  # CORRETTO IN checked_at
+            .execute()
     )
 
 async def _db_upsert(data: dict):
@@ -88,14 +93,13 @@ def health():
 async def verify_company(payload: KYCRequest, _ = Depends(verify_rapidapi_gate)):
     target_url = str(payload.url).strip()
 
-    # Claude's URL Validation
     parsed_url = urlparse(target_url)
     if parsed_url.scheme not in ("http", "https"):
         raise HTTPException(status_code=400, detail="Only HTTP and HTTPS URLs are supported.")
     if not parsed_url.netloc:
         raise HTTPException(status_code=400, detail="Invalid URL: no host found.")
 
-    # 1. Atomic cache check
+    # 1. Atomic cache check (TTL-aware)
     try:
         cached = await _db_get_cached(target_url)
         if cached.data:
@@ -114,14 +118,13 @@ async def verify_company(payload: KYCRequest, _ = Depends(verify_rapidapi_gate))
     except Exception:
         pass
 
-    # 2. Secure streaming scrape (RESTORED OUR BUSINESS LOGIC)
+    # 2. Secure streaming scrape
     html = None
     http_status = 200
     error_mode = None
 
     try:
         transport = PinnedIPTransport(verify=True)
-        # Maintained follow_redirects=True for business logic resilience
         async with httpx.AsyncClient(transport=transport, timeout=8.0, follow_redirects=True) as client:
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -147,21 +150,10 @@ async def verify_company(payload: KYCRequest, _ = Depends(verify_rapidapi_gate))
         http_status = 0
         error_mode = f"CONNECTION_FAILED_{type(e).__name__}"
 
-    # 3. Graceful Failure Handling for RapidAPI Success Rate
+    # 3. Graceful failure handling (Non va più in cache)
     if error_mode or http_status != 200:
         trust_score = 15
         risk_level = "CRITICAL"
-        
-        try:
-            await _db_upsert({
-                "url": target_url,
-                "trust_score": trust_score,
-                "risk_level": risk_level,
-                "ai_text_probability": 0,
-                "broken_links_count": 0
-            })
-        except:
-            pass
 
         return {
             "status": "success",
@@ -187,7 +179,6 @@ async def verify_company(payload: KYCRequest, _ = Depends(verify_rapidapi_gate))
         if href in ["#", "", "javascript:void(0)", "javascript:void(0);"]:
             dead_links += 1
         else:
-            # Claude's elegant social link fix
             for pattern in social_domains:
                 if re.search(pattern, href):
                     parsed = urlparse(href)
@@ -213,13 +204,15 @@ async def verify_company(payload: KYCRequest, _ = Depends(verify_rapidapi_gate))
     else:
         risk_level = "CRITICAL"
 
+    # 5. Persist successful analysis to cache
     try:
         await _db_upsert({
             "url": target_url,
             "trust_score": trust_score,
             "risk_level": risk_level,
             "ai_text_probability": ai_probability,
-            "broken_links_count": dead_links
+            "broken_links_count": dead_links,
+            "checked_at": datetime.utcnow().isoformat()  # CORRETTO IN checked_at
         })
     except Exception:
         pass
